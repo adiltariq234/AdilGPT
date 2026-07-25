@@ -1,9 +1,11 @@
 import os
-from pathlib import Path
 import sqlite3
+import threading
+from pathlib import Path
+from functools import lru_cache
+from typing import Dict, Optional
 
 from dotenv import load_dotenv
-
 import certifi
 
 load_dotenv()
@@ -16,135 +18,178 @@ from langchain_core.messages import SystemMessage
 from langgraph.graph import StateGraph, START, MessagesState
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.sqlite import SqliteSaver
-
 from langchain_groq import ChatGroq
 from langchain_mistralai import ChatMistralAI
+from tools import tools
 
 Path("data").mkdir(exist_ok=True)
+
+# ─────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "llama-3.3-70b-versatile")
 
 ALLOWED_MODELS = {
     # Google Gemini
     "gemini-2.5-flash",
     "gemini-2.5-pro",
-
     # Groq
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
     "deepseek-r1-distill-llama-70b",
-
     # Mistral
     "mistral-small-latest",
     "mistral-medium-latest",
     "mistral-large-latest",
 }
 
-SYSTEM_PROMPT = """
-You are AdilGPT, an advanced AI assistant designed to provide accurate, helpful, and intelligent responses. Your primary goal is to assist users efficiently while maintaining clarity, professionalism, and reliability.
+MODEL_CONFIG = {
+    "gemini-2.5-flash": {"provider": "google", "max_tokens": 8192, "context": 1_000_000},
+    "gemini-2.5-pro": {"provider": "google", "max_tokens": 8192, "context": 1_000_000},
+    "llama-3.3-70b-versatile": {"provider": "groq", "max_tokens": 32768, "context": 128_000},
+    "llama-3.1-8b-instant": {"provider": "groq", "max_tokens": 8192, "context": 128_000},
+    "deepseek-r1-distill-llama-70b": {"provider": "groq", "max_tokens": 32768, "context": 128_000},
+    "mistral-small-latest": {"provider": "mistral", "max_tokens": 32000, "context": 128_000},
+    "mistral-medium-latest": {"provider": "mistral", "max_tokens": 32000, "context": 128_000},
+    "mistral-large-latest": {"provider": "mistral", "max_tokens": 32000, "context": 128_000},
+}
 
-Capabilities:
-1. Answer general knowledge and technical questions.
-2. Assist with programming, debugging, and software development.
-3. Explain concepts in a simple and easy-to-understand manner.
-4. Search uploaded documents using the RAG knowledge base when required.
-5. Search the web for real-time or recent information using Tavily Search.
-6. Remember important user preferences using the memory tool.
-7. Recall previously saved memories whenever they improve the response.
-8. Perform mathematical calculations using the calculator tool.
-9. Generate structured outputs such as code, tables, summaries, reports, and documentation.
-10. Guide users step-by-step when solving complex problems.
+SYSTEM_PROMPT = """
+You are AdilGPT, an advanced AI assistant. Provide accurate, helpful, and intelligent responses.
 
 Rules:
-- Be accurate, concise, and professional.
-- Always answer using the best available information.
-- If the user asks about uploaded files, use the RAG tool before responding.
-- If the user asks about current events, news, weather, stock prices, or any real-time information, use Tavily Search.
-- If the user refers to previous conversations or saved preferences, use the memory tool.
-- Use the calculator tool for mathematical computations instead of estimating.
-- Never fabricate information. If you are uncertain, clearly state your limitations.
-- When external tools are used, naturally integrate their results into the response.
-- Format answers using Markdown with headings, bullet points, tables, and code blocks whenever appropriate.
-- Maintain a friendly, respectful, and helpful tone.
+- Be concise, accurate, and professional.
+- Use Markdown formatting (headings, lists, tables, code blocks).
+- For uploaded files: use RAG tool first.
+- For real-time info: use Tavily Search.
+- For math: use calculator tool.
+- For memories: use recall/remember tools.
+- Never fabricate information. State limitations clearly.
 - Prioritize correctness over speed.
-
-Your objective is to deliver responses that are intelligent, reliable, and easy to understand.
 """
 
+# ─────────────────────────────────────────────────────────────
+# Thread-safe Agent Cache
+# ─────────────────────────────────────────────────────────────
+_agent_cache: Dict[str, any] = {}
+_cache_lock = threading.Lock()
 
-def normalize_model_name(model_name : str | None) -> str:
-    """
-    Validate Selected Model in fronted 
-    if model is missing is not allowed , fall back to default model 
-    """
+
+def normalize_model_name(model_name: Optional[str]) -> str:
+    """Validate and normalize model name."""
     if not model_name:
         return DEFAULT_MODEL
-    model_name=model_name.strip()
-
+    model_name = model_name.strip()
     if model_name not in ALLOWED_MODELS:
         return DEFAULT_MODEL
     return model_name
 
+
+def validate_api_key_for_model(model_name: str) -> None:
+    """Ensure required API key exists for selected model."""
+    provider = MODEL_CONFIG.get(model_name, {}).get("provider", "")
+
+    key_map = {
+        "google": "GOOGLE_API_KEY",
+        "groq": "GROQ_API_KEY",
+        "mistral": "MISTRAL_API_KEY",
+    }
+
+    required_key = key_map.get(provider)
+    if required_key and not os.getenv(required_key):
+        raise RuntimeError(
+            f"Model '{model_name}' requires {required_key} environment variable."
+        )
+
+
 def build_agent(model_name: str):
+    """Build a LangGraph agent for the selected AI model."""
+    import time
+    start = time.time()
     """
     Build a LangGraph agent for the selected AI model.
     Supports Google Gemini, Groq, and Mistral.
     """
-
     selected_model = normalize_model_name(model_name)
+    validate_api_key_for_model(selected_model)
 
-    # Google Gemini
-    if selected_model.startswith("gemini"):
-        llm = ChatGoogleGenerativeAI(
-            model=selected_model,
-            temperature=0.3,
-            streaming=True,
-        )
+    config = MODEL_CONFIG.get(selected_model, {})
+    max_tokens = config.get("max_tokens", 4096)
 
-    # Groq Models
-    elif selected_model.startswith(("llama", "deepseek", "qwen")):
-        llm = ChatGroq(
-            model=selected_model,
-            temperature=0.3,
-            streaming=True,
-        )
+    try:
+        # Google Gemini
+        if selected_model.startswith("gemini"):
+            llm = ChatGoogleGenerativeAI(
+                model=selected_model,
+                temperature=0.3,
+                max_output_tokens=max_tokens,
+                streaming=True,
+            )
 
-    # Mistral Models
-    elif selected_model.startswith("mistral"):
-        llm = ChatMistralAI(
-            model=selected_model,
-            temperature=0.3,
-            streaming=True,
-        )
+        # Groq Models
+        elif selected_model.startswith(("llama", "deepseek", "qwen")):
+            llm = ChatGroq(
+                model=selected_model,
+                temperature=0.3,
+                max_tokens=max_tokens,
+                streaming=True,
+            )
 
-    else:
-        raise ValueError(f"Unsupported model: {selected_model}")
+        # Mistral Models
+        elif selected_model.startswith("mistral"):
+            llm = ChatMistralAI(
+                model=selected_model,
+                temperature=0.3,
+                max_tokens=max_tokens,
+                streaming=True,
+            )
+
+        else:
+            raise ValueError(f"Unsupported model: {selected_model}")
+
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize LLM '{selected_model}': {e}") from e
 
     llm_with_tools = llm.bind_tools(tools)
 
-    def chatbot_node(state : MessagesState):
-        messages=[SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+    def chatbot_node(state: MessagesState):
+        messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+        response = llm_with_tools.invoke(messages)
+        return {"messages": [response]}
 
-        response=llm_with_tools.invoke(messages)
+    tool_node = ToolNode(tools)
+    workflow = StateGraph(MessagesState)
 
-        return {
-            "messages" :[response]
+    workflow.add_node("chatbot", chatbot_node)
+    workflow.add_node("tools", tool_node)
 
-        }
-
-    tool_node=ToolNode(tools)
-    workflow=StateGraph(MessagesState)
-
-    workflow.add_node("chatbot",chatbot_node)
-    workflow.add_node("tools",tool_node)
-
-    workflow.add_edge(START,"chatbot")
+    workflow.add_edge(START, "chatbot")
     workflow.add_conditional_edges("chatbot", tools_condition)
-    workflow.add_edge("tools","chatbot")
+    workflow.add_edge("tools", "chatbot")
 
-    conn=sqlite3.connect(
-        "data/langgraph_checkpoints.sqlite",
-        check_same_thread=False
-    )
+    # Use configurable SQLite path
+    db_path = os.getenv("LANGGRAPH_DB_PATH", "data/langgraph_checkpoints.sqlite")
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    checkpointer = SqliteSaver(conn)
 
-    checkpointer=SqliteSaver(conn)
+    print(f"[Agent] Built agent for {selected_model} in {time.time() - start:.2f}s")
     return workflow.compile(checkpointer=checkpointer)
+
+
+def get_agent(model_name: Optional[str] = None):
+    """
+    Get or create a cached agent instance for the given model.
+    Thread-safe singleton pattern with LRU-style caching.
+    """
+    selected_model = normalize_model_name(model_name)
+
+    with _cache_lock:
+        if selected_model not in _agent_cache:
+            _agent_cache[selected_model] = build_agent(selected_model)
+        return _agent_cache[selected_model]
+
+
+def clear_agent_cache():
+    """Clear all cached agents. Useful for testing or memory management."""
+    with _cache_lock:
+        _agent_cache.clear()
